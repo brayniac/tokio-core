@@ -413,10 +413,8 @@ impl Loop {
                 Direction::Read => (&mut sched.reader, 1),
                 Direction::Write => (&mut sched.writer, 2),
             };
-            let ready = sched.readiness.load(Ordering::SeqCst);
-            if ready & bit != 0 {
+            if sched.readiness.load(Ordering::SeqCst) & bit != 0 {
                 *slot = None;
-                sched.readiness.store(ready & !bit, Ordering::SeqCst);
                 Some(wake)
             } else {
                 *slot = Some(wake);

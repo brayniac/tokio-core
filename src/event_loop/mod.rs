@@ -121,6 +121,7 @@ enum Message {
 const TOKEN_MESSAGES: mio::Token = mio::Token(0);
 const TOKEN_FUTURE: mio::Token = mio::Token(1);
 const TOKEN_NEW_FUTURES: mio::Token = mio::Token(2);
+const TOKEN_START: usize = 3;
 
 impl Loop {
     /// Creates a new event loop, returning any error that happened during the
@@ -300,7 +301,7 @@ impl Loop {
     }
 
     fn dispatch(&self, token: mio::Token, ready: mio::Ready) {
-        let token = usize::from(token) - 3;
+        let token = usize::from(token) - TOKEN_START;
         if token % 2 == 0 {
             self.dispatch_io(token / 2, ready)
         } else {
@@ -392,7 +393,7 @@ impl Loop {
         }
         let entry = dispatch.vacant_entry().unwrap();
         try!(self.io.register(source,
-                              mio::Token(3 + entry.index() * 2),
+                              mio::Token(TOKEN_START + entry.index() * 2),
                               mio::Ready::readable() | mio::Ready::writable(),
                               mio::PollOpt::edge()));
         Ok((sched.readiness.clone(), entry.insert(sched).index()))
@@ -466,8 +467,9 @@ impl Loop {
                 dispatch.grow(len);
             }
             let entry = dispatch.vacant_entry().unwrap();
+            let token = TOKEN_START + 2 * entry.index() + 1;
             let pair = mio::Registration::new(&self.io,
-                                              mio::Token(3 + 2 * entry.index() + 1),
+                                              mio::Token(token),
                                               mio::Ready::readable(),
                                               mio::PollOpt::level());
             let unpark = Arc::new(MySetReadiness(pair.1));

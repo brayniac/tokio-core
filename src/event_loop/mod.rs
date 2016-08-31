@@ -89,7 +89,7 @@ struct Scheduled {
 }
 
 struct FutureTask {
-    spawn: Spawn<Box<Future<Item=(), Error=()>>>,
+    spawn: Option<Spawn<Box<Future<Item=(), Error=()>>>>,
     wake: Arc<Unpark>,
 }
 
@@ -447,7 +447,7 @@ impl Loop {
                 handle: self.handle(),
             });
             let entry = entry.insert(FutureTask {
-                spawn: task::spawn(future),
+                spawn: Some(task::spawn(future)),
                 wake: unpark,
             });
             entry.get().wake.clone()
@@ -456,19 +456,30 @@ impl Loop {
     }
 
     fn poll_task(&self, idx: usize) {
-        let mut tasks = self.futures.borrow_mut();
-        {
+        let (mut spawn, wake) = {
+            let mut tasks = self.futures.borrow_mut();
             let task = match tasks.get_mut(idx) {
                 Some(task) => task,
                 None => return,
             };
-            match task.spawn.poll_future(task.wake.clone()) {
-                Poll::NotReady => return,
-                Poll::Ok(()) |
-                Poll::Err(()) => {}
+            match task.spawn.take() {
+                Some(spawn) => (spawn, task.wake.clone()),
+                None => return,
+            }
+        };
+        let res = spawn.poll_future(wake);
+        let mut tasks = self.futures.borrow_mut();
+        match res {
+            Poll::NotReady => {
+                assert!(tasks[idx].spawn.is_none());
+                tasks[idx].spawn = Some(spawn);
+            }
+            Poll::Ok(()) |
+            Poll::Err(()) => {
+                let task = tasks.remove(idx).unwrap();
+                assert!(task.spawn.is_none());
             }
         }
-        tasks.remove(idx).unwrap();
     }
 
     fn consume_queue(&self) {

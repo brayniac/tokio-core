@@ -23,3 +23,24 @@ fn simple() {
 
     assert_eq!(lp.run(rx1.join(rx2)).unwrap(), (1, 2));
 }
+
+#[test]
+fn spawn_in_poll() {
+    let mut lp = Loop::new().unwrap();
+
+    let (tx1, rx1) = futures::oneshot();
+    let (tx2, rx2) = futures::oneshot();
+    let handle = lp.handle();
+    lp.pin().spawn(futures::lazy(move || {
+        tx1.complete(1);
+        handle.spawn(|_| {
+            futures::lazy(|| {
+                tx2.complete(2);
+                Ok(())
+            })
+        });
+        Ok(())
+    }));
+
+    assert_eq!(lp.run(rx1.join(rx2)).unwrap(), (1, 2));
+}

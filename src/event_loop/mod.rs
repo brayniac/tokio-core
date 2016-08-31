@@ -341,7 +341,7 @@ impl Loop {
             Some(task) => task,
             None => return,
         };
-        let res = task.poll_future(wake);
+        let res = CURRENT_LOOP.set(self, || task.poll_future(wake));
         let mut dispatch = self.task_dispatch.borrow_mut();
         match res {
             Poll::NotReady => {

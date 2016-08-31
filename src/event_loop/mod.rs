@@ -435,21 +435,24 @@ impl Loop {
     }
 
     fn spawn(&self, future: Box<Future<Item=(), Error=()>>) {
-        let mut tasks = self.futures.borrow_mut();
-        if tasks.vacant_entry().is_none() {
-            let len = tasks.count();
-            tasks.grow(len);
-        }
-        let entry = tasks.vacant_entry().unwrap();
-        let unpark = Arc::new(MyUnpark {
-            idx: entry.index(),
-            handle: self.handle(),
-        });
-        let entry = entry.insert(FutureTask {
-            spawn: task::spawn(future),
-            wake: unpark,
-        });
-        entry.get().wake.unpark();
+        let unpark = {
+            let mut tasks = self.futures.borrow_mut();
+            if tasks.vacant_entry().is_none() {
+                let len = tasks.count();
+                tasks.grow(len);
+            }
+            let entry = tasks.vacant_entry().unwrap();
+            let unpark = Arc::new(MyUnpark {
+                idx: entry.index(),
+                handle: self.handle(),
+            });
+            let entry = entry.insert(FutureTask {
+                spawn: task::spawn(future),
+                wake: unpark,
+            });
+            entry.get().wake.clone()
+        };
+        unpark.unpark();
     }
 
     fn poll_task(&self, idx: usize) {

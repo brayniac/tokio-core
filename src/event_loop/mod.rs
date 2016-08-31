@@ -37,11 +37,14 @@ pub struct Loop {
     id: usize,
     io: mio::Poll,
     events: mio::Events,
-    tx: Arc<MioSender>,
+    tx: Arc<Sender<Message>>,
     rx: Receiver<Message>,
-    dispatch: RefCell<Slab<Scheduled, usize>>,
-    futures: RefCell<Slab<FutureTask, usize>>,
-    new_futures: Rc<RefCell<Vec<Box<Future<Item=(), Error=()>>>>>,
+    io_dispatch: RefCell<Slab<ScheduledIo, usize>>,
+    task_dispatch: RefCell<Slab<ScheduledTask, usize>>,
+
+    // Incoming queue of newly spawned futures
+    new_futures: Rc<NewFutures>,
+    _new_futures_registration: mio::Registration,
 
     // Used for determining when the future passed to `run` is ready. Once the
     // registration is passed to `io` above we never touch it again, just keep
@@ -59,10 +62,6 @@ pub struct Loop {
     timeouts: RefCell<Slab<(Timeout, TimeoutState), usize>>,
 }
 
-struct MioSender {
-    inner: Sender<Message>,
-}
-
 /// Handle to an event loop, used to construct I/O objects, send messages, and
 /// otherwise interact indirectly with the event loop itself.
 ///
@@ -71,7 +70,7 @@ struct MioSender {
 #[derive(Clone)]
 pub struct LoopHandle {
     id: usize,
-    tx: Arc<MioSender>,
+    tx: Arc<Sender<Message>>,
 }
 
 /// A non-sendable handle to an event loop, useful for manufacturing instances
@@ -79,18 +78,24 @@ pub struct LoopHandle {
 #[derive(Clone)]
 pub struct LoopPin {
     handle: LoopHandle,
-    futures: Rc<RefCell<Vec<Box<Future<Item=(), Error=()>>>>>,
+    futures: Rc<NewFutures>,
 }
 
-struct Scheduled {
+struct ScheduledIo {
     readiness: Arc<AtomicUsize>,
     reader: Option<Task>,
     writer: Option<Task>,
 }
 
-struct FutureTask {
+struct ScheduledTask {
+    _registration: mio::Registration,
     spawn: Option<Spawn<Box<Future<Item=(), Error=()>>>>,
-    wake: Arc<Unpark>,
+    wake: Arc<MySetReadiness>,
+}
+
+struct NewFutures {
+    queue: RefCell<Vec<Box<Future<Item=(), Error=()>>>>,
+    ready: mio::SetReadiness,
 }
 
 enum TimeoutState {
@@ -110,9 +115,12 @@ enum Message {
     AddTimeout(Instant, Arc<Slot<io::Result<(usize, Instant)>>>),
     UpdateTimeout(usize, Task),
     CancelTimeout(usize),
-    Poll(usize),
     Run(Box<FnBox>),
 }
+
+const TOKEN_MESSAGES: mio::Token = mio::Token(0);
+const TOKEN_FUTURE: mio::Token = mio::Token(1);
+const TOKEN_NEW_FUTURES: mio::Token = mio::Token(2);
 
 impl Loop {
     /// Creates a new event loop, returning any error that happened during the
@@ -121,27 +129,34 @@ impl Loop {
         let (tx, rx) = channel();
         let io = try!(mio::Poll::new());
         try!(io.register(&rx,
-                         mio::Token(0),
+                         TOKEN_MESSAGES,
                          mio::Ready::readable(),
                          mio::PollOpt::edge()));
-        let pair = mio::Registration::new(&io,
-                                          mio::Token(1),
-                                          mio::Ready::readable(),
-                                          mio::PollOpt::level());
-        let (registration, readiness) = pair;
+        let future_pair = mio::Registration::new(&io,
+                                                 TOKEN_FUTURE,
+                                                 mio::Ready::readable(),
+                                                 mio::PollOpt::level());
+        let new_future_pair = mio::Registration::new(&io,
+                                                     TOKEN_NEW_FUTURES,
+                                                     mio::Ready::readable(),
+                                                     mio::PollOpt::level());
         Ok(Loop {
             id: NEXT_LOOP_ID.fetch_add(1, Ordering::Relaxed),
             io: io,
             events: mio::Events::with_capacity(1024),
-            tx: Arc::new(MioSender { inner: tx }),
+            tx: Arc::new(tx),
             rx: rx,
-            _future_registration: registration,
-            future_readiness: Arc::new(MySetReadiness(readiness)),
-            dispatch: RefCell::new(Slab::new_starting_at(2, SLAB_CAPACITY)),
+            io_dispatch: RefCell::new(Slab::new_starting_at(0, SLAB_CAPACITY)),
+            task_dispatch: RefCell::new(Slab::new_starting_at(0, SLAB_CAPACITY)),
             timeouts: RefCell::new(Slab::new_starting_at(0, SLAB_CAPACITY)),
             timer_wheel: RefCell::new(TimerWheel::new()),
-            futures: RefCell::new(Slab::new_starting_at(0, 1024)),
-            new_futures: Rc::new(RefCell::new(Vec::new())),
+            _future_registration: future_pair.0,
+            future_readiness: Arc::new(MySetReadiness(future_pair.1)),
+            _new_futures_registration: new_future_pair.0,
+            new_futures: Rc::new(NewFutures {
+                queue: RefCell::new(Vec::new()),
+                ready: new_future_pair.1,
+            }),
         })
     }
 
@@ -205,8 +220,6 @@ impl Loop {
         // to see if it's done. If it's not then the event loop will turn again.
         let mut res = None;
         self._run(&mut || {
-            ready.0.set_readiness(mio::Ready::none())
-                   .expect("failed to set readiness");
             assert!(res.is_none());
             match task.poll_future(ready.clone()) {
                 Poll::NotReady => {}
@@ -233,13 +246,7 @@ impl Loop {
             // attaching strace, or similar.
             let start = Instant::now();
             loop {
-                let timeout = if self.new_futures.borrow().len() > 0 {
-                    Some(start)
-                } else {
-                    self.timer_wheel.borrow().next_timeout()
-                };
-
-                let timeout = timeout.map(|t| {
+                let timeout = self.timer_wheel.borrow().next_timeout().map(|t| {
                     if t < start {
                         Duration::new(0, 0)
                     } else {
@@ -264,69 +271,86 @@ impl Loop {
             let start = Instant::now();
             self.consume_timeouts(start);
 
-            // Spawn all futures we've gotten from our LoopPin
-            let mut new_futures = self.new_futures.borrow_mut();
-            for future in new_futures.drain(..) {
-                self.spawn(future);
-            }
-            drop(new_futures);
-
             // Next, process all the events that came in.
             for i in 0..self.events.len() {
                 let event = self.events.get(i).unwrap();
-                let token = usize::from(event.token());
+                let token = event.token();
+                trace!("event {:?} {:?}", event.kind(), event.token());
 
-                // Token 0 == our incoming message queue, so this means we
-                // process the whole queue of messages.
-                //
-                // Token 1 == we should poll the future, we'll do that right
-                // after we get through the rest of this tick of the event loop.
-                if token == 0 {
-                    debug!("consuming notification queue");
-                    CURRENT_LOOP.set(&self, || {
-                        self.consume_queue();
-                    });
-                    continue
-                } else if token == 1 {
+                if token == TOKEN_MESSAGES {
+                    CURRENT_LOOP.set(&self, || self.consume_queue());
+                } else if token == TOKEN_FUTURE {
+                    self.future_readiness.0.set_readiness(mio::Ready::none()).unwrap();
                     if !finished && CURRENT_LOOP.set(self, || done()) {
                         finished = true;
                     }
-                    continue
-                }
-
-                trace!("event {:?} {:?}", event.kind(), event.token());
-
-                // For any other token we look at `dispatch` to see what we're
-                // supposed to do. If there's a waiter we get ready to notify
-                // it, and we also or-in atomically any events that have
-                // happened (currently read/write events).
-                let mut reader = None;
-                let mut writer = None;
-                if let Some(sched) = self.dispatch.borrow_mut().get_mut(token) {
-                    if event.kind().is_readable() {
-                        reader = sched.reader.take();
-                        sched.readiness.fetch_or(1, Ordering::Relaxed);
-                    }
-                    if event.kind().is_writable() {
-                        writer = sched.writer.take();
-                        sched.readiness.fetch_or(2, Ordering::Relaxed);
+                } else if token == TOKEN_NEW_FUTURES {
+                    self.new_futures.ready.set_readiness(mio::Ready::none()).unwrap();
+                    let mut new_futures = self.new_futures.queue.borrow_mut();
+                    for future in new_futures.drain(..) {
+                        self.spawn(future);
                     }
                 } else {
-                    debug!("notified on {} which no longer exists", token);
-                }
-
-                // If we actually got a waiter, then notify!
-                //
-                // TODO: don't notify the same task twice
-                if let Some(reader) = reader {
-                    self.notify_handle(reader);
-                }
-                if let Some(writer) = writer {
-                    self.notify_handle(writer);
+                    self.dispatch(token, event.kind());
                 }
             }
 
             debug!("loop process - {} events, {:?}", amt, start.elapsed());
+        }
+    }
+
+    fn dispatch(&self, token: mio::Token, ready: mio::Ready) {
+        let token = usize::from(token) - 3;
+        if token % 2 == 0 {
+            self.dispatch_io(token / 2, ready)
+        } else {
+            self.dispatch_task(token / 2)
+        }
+    }
+
+    fn dispatch_io(&self, token: usize, ready: mio::Ready) {
+        let mut reader = None;
+        let mut writer = None;
+        if let Some(io) = self.io_dispatch.borrow_mut().get_mut(token) {
+            if ready.is_readable() {
+                reader = io.reader.take();
+                io.readiness.fetch_or(1, Ordering::Relaxed);
+            }
+            if ready.is_writable() {
+                writer = io.writer.take();
+                io.readiness.fetch_or(2, Ordering::Relaxed);
+            }
+        }
+        // TODO: don't notify the same task twice
+        if let Some(reader) = reader {
+            self.notify_handle(reader);
+        }
+        if let Some(writer) = writer {
+            self.notify_handle(writer);
+        }
+    }
+
+    fn dispatch_task(&self, token: usize) {
+        let (task, wake) = match self.task_dispatch.borrow_mut().get_mut(token) {
+            Some(slot) => (slot.spawn.take(), slot.wake.clone()),
+            None => return,
+        };
+        wake.0.set_readiness(mio::Ready::none()).unwrap();
+        let mut task = match task {
+            Some(task) => task,
+            None => return,
+        };
+        let res = task.poll_future(wake);
+        let mut dispatch = self.task_dispatch.borrow_mut();
+        match res {
+            Poll::NotReady => {
+                assert!(dispatch[token].spawn.is_none());
+                dispatch[token].spawn = Some(task);
+            }
+            Poll::Ok(()) |
+            Poll::Err(()) => {
+                dispatch.remove(token).unwrap();
+            }
         }
     }
 
@@ -356,19 +380,19 @@ impl Loop {
     fn add_source(&self, source: &mio::Evented)
                   -> io::Result<(Arc<AtomicUsize>, usize)> {
         debug!("adding a new I/O source");
-        let sched = Scheduled {
+        let sched = ScheduledIo {
             readiness: Arc::new(AtomicUsize::new(0)),
             reader: None,
             writer: None,
         };
-        let mut dispatch = self.dispatch.borrow_mut();
+        let mut dispatch = self.io_dispatch.borrow_mut();
         if dispatch.vacant_entry().is_none() {
             let amt = dispatch.count();
             dispatch.grow(amt);
         }
         let entry = dispatch.vacant_entry().unwrap();
         try!(self.io.register(source,
-                              mio::Token(entry.index()),
+                              mio::Token(3 + entry.index() * 2),
                               mio::Ready::readable() | mio::Ready::writable(),
                               mio::PollOpt::edge()));
         Ok((sched.readiness.clone(), entry.insert(sched).index()))
@@ -376,13 +400,13 @@ impl Loop {
 
     fn drop_source(&self, token: usize) {
         debug!("dropping I/O source: {}", token);
-        self.dispatch.borrow_mut().remove(token).unwrap();
+        self.io_dispatch.borrow_mut().remove(token).unwrap();
     }
 
     fn schedule(&self, token: usize, wake: Task, dir: Direction) {
         debug!("scheduling direction for: {}", token);
         let to_call = {
-            let mut dispatch = self.dispatch.borrow_mut();
+            let mut dispatch = self.io_dispatch.borrow_mut();
             let sched = dispatch.get_mut(token).unwrap();
             let (slot, bit) = match dir {
                 Direction::Read => (&mut sched.reader, 1),
@@ -436,53 +460,29 @@ impl Loop {
 
     fn spawn(&self, future: Box<Future<Item=(), Error=()>>) {
         let unpark = {
-            let mut tasks = self.futures.borrow_mut();
-            if tasks.vacant_entry().is_none() {
-                let len = tasks.count();
-                tasks.grow(len);
+            let mut dispatch = self.task_dispatch.borrow_mut();
+            if dispatch.vacant_entry().is_none() {
+                let len = dispatch.count();
+                dispatch.grow(len);
             }
-            let entry = tasks.vacant_entry().unwrap();
-            let unpark = Arc::new(MyUnpark {
-                idx: entry.index(),
-                handle: self.handle(),
-            });
-            let entry = entry.insert(FutureTask {
+            let entry = dispatch.vacant_entry().unwrap();
+            let pair = mio::Registration::new(&self.io,
+                                              mio::Token(3 + 2 * entry.index() + 1),
+                                              mio::Ready::readable(),
+                                              mio::PollOpt::level());
+            let unpark = Arc::new(MySetReadiness(pair.1));
+            let entry = entry.insert(ScheduledTask {
                 spawn: Some(task::spawn(future)),
                 wake: unpark,
+                _registration: pair.0,
             });
             entry.get().wake.clone()
         };
         unpark.unpark();
     }
 
-    fn poll_task(&self, idx: usize) {
-        let (mut spawn, wake) = {
-            let mut tasks = self.futures.borrow_mut();
-            let task = match tasks.get_mut(idx) {
-                Some(task) => task,
-                None => return,
-            };
-            match task.spawn.take() {
-                Some(spawn) => (spawn, task.wake.clone()),
-                None => return,
-            }
-        };
-        let res = spawn.poll_future(wake);
-        let mut tasks = self.futures.borrow_mut();
-        match res {
-            Poll::NotReady => {
-                assert!(tasks[idx].spawn.is_none());
-                tasks[idx].spawn = Some(spawn);
-            }
-            Poll::Ok(()) |
-            Poll::Err(()) => {
-                let task = tasks.remove(idx).unwrap();
-                assert!(task.spawn.is_none());
-            }
-        }
-    }
-
     fn consume_queue(&self) {
+        debug!("consuming notification queue");
         // TODO: can we do better than `.unwrap()` here?
         while let Some(msg) = self.rx.recv().unwrap() {
             self.notify(msg);
@@ -501,7 +501,6 @@ impl Loop {
             Message::UpdateTimeout(t, handle) => self.update_timeout(t, handle),
             Message::CancelTimeout(t) => self.cancel_timeout(t),
             Message::Run(r) => r.call_box(self),
-            Message::Poll(idx) => self.poll_task(idx),
         }
     }
 }
@@ -517,7 +516,7 @@ impl LoopHandle {
                     lp.notify(msg);
                 }
                 None => {
-                    match self.tx.inner.send(msg) {
+                    match self.tx.send(msg) {
                         Ok(()) => {}
 
                         // This should only happen when there was an error
@@ -578,7 +577,8 @@ impl LoopPin {
     pub fn spawn<F>(&self, f: F)
         where F: Future<Item=(), Error=()> + 'static,
     {
-        self.futures.borrow_mut().push(Box::new(f));
+        self.futures.queue.borrow_mut().push(Box::new(f));
+        self.futures.ready.set_readiness(mio::Ready::readable()).unwrap();
     }
 }
 
@@ -657,17 +657,6 @@ impl Unpark for MySetReadiness {
     fn unpark(&self) {
         self.0.set_readiness(mio::Ready::readable())
               .expect("failed to set readiness");
-    }
-}
-
-struct MyUnpark {
-    idx: usize,
-    handle: LoopHandle,
-}
-
-impl Unpark for MyUnpark {
-    fn unpark(&self) {
-        self.handle.send(Message::Poll(self.idx));
     }
 }
 
